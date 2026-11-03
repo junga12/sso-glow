@@ -12,6 +12,18 @@ AWS SSO 세션이 살아 있는지 한눈에 확인하고, 만료됐으면 버�
 
 브라우저가 자동으로 열리지 않으면 aws CLI가 출력한 인증 URL과 코드를 화면에 보여주고, **인증 페이지 열기** 버튼으로 직접 열 수 있습니다.
 
+## 기술 스택
+
+| 구분 | 내용 |
+|---|---|
+| 언어 | Go 1.27 (cgo 미사용, 외부 런타임 없음) |
+| UI 프레임워크 | [egoist/mygo](https://github.com/egoist/mygo) v0.7.4 네이티브 UI. 웹뷰 없이 Go 코드로 뷰를 선언하면 Metal로 직접 그립니다. 플렉스박스 레이아웃, 시스템 테마(라이트·다크) 자동 적용 |
+| AWS 연동 | AWS CLI v2를 `os/exec`로 호출 (`sts get-caller-identity`, `sso login`). SDK를 쓰지 않아 토큰 캐시와 브라우저 인증을 CLI에 그대로 맡깁니다 |
+| 동시성 | 프로필별 검사를 고루틴으로 병렬 실행하고, 결과는 `Window.Update`로 메인 스레드에 반영 |
+| 테스트 | 표준 `testing` + mygo의 `ui.NewTester`(창 없이 뷰를 렌더링해 클릭·텍스트 검증). aws CLI는 인터페이스로 분리해 가짜 구현으로 대체 |
+| 빌드·배포 | `mygo` CLI로 `.app` 번들과 DMG 생성, ad hoc 코드 서명 |
+| 의존성 | `github.com/egoist/mygo` 하나. 나머지는 그 간접 의존성(purego, go-text, x/image, x/net, x/text) |
+
 ## 요구 사항
 
 - macOS 12 이상 (Apple Silicon 기준으로 빌드. Intel은 아래 빌드 옵션 참고)
