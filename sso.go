@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,14 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/ssocreds"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
+	ssooidctypes "github.com/aws/aws-sdk-go-v2/service/ssooidc/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 )
 
 // Profile 은 ~/.aws/config 에 정의된 SSO 프로필 하나다.
@@ -22,6 +31,20 @@ type Profile struct {
 	Session string // sso_session 값
 	Account string // sso_account_id (표시용)
 	Role    string // sso_role_name (표시용)
+	Region  string // region. 비어 있으면 검사 시 sso-session 의 sso_region 을 쓴다
+}
+
+// Session 은 [sso-session NAME] 섹션이다.
+type Session struct {
+	Name   string
+	Region string // sso_region. 토큰 갱신 요청을 보낼 Identity Center 리전
+}
+
+// Config 는 config 파일에서 앱이 쓰는 부분만 뽑은 것이다.
+type Config struct {
+	Profiles []Profile          // sso_session 이 설정된 프로필, 파일 순서
+	Sessions map[string]Session // sso-session 이름 → 설정
+	Skipped  []string           // 이름이 유효하지 않아 건너뛴 프로필
 }
 
 // defaultConfigPath 는 AWS_CONFIG_FILE 또는 ~/.aws/config 를 돌려준다.
@@ -36,16 +59,14 @@ func defaultConfigPath() string {
 	return filepath.Join(home, ".aws", "config")
 }
 
-// loadProfiles 는 config 파일에서 sso_session 이 설정된 프로필만 파일 순서대로 돌려준다.
-// [default] 섹션도 sso_session 이 있으면 "default" 이름으로 포함한다.
-// 두 번째 반환값은 이름이 유효하지 않아 건너뛴 프로필들이다.
-func loadProfiles(path string) ([]Profile, []string, error) {
+// loadConfig 는 config 파일을 읽어 SSO 프로필과 sso-session 정의를 돌려준다.
+func loadConfig(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer f.Close()
-	return parseProfiles(f)
+	return parseConfig(f)
 }
 
 // validName 은 aws CLI 인자로 그대로 넘겨도 안전한 이름인지 검사한다.
@@ -62,12 +83,15 @@ func validName(s string) bool {
 	return true
 }
 
-func parseProfiles(r io.Reader) ([]Profile, []string, error) {
+// parseConfig 는 [profile X]·[default] 섹션에서 sso_session 이 설정된 프로필을,
+// [sso-session X] 섹션에서 sso_region 을 읽는다.
+func parseConfig(r io.Reader) (*Config, error) {
 	var (
-		profiles []Profile
-		cur      *Profile // 현재 읽고 있는 프로필 섹션. 프로필이 아니면 nil
-		order    []string
-		byName   = map[string]*Profile{}
+		cur     *Profile // 현재 읽고 있는 프로필 섹션. 프로필이 아니면 nil
+		curSess *Session // 현재 읽고 있는 sso-session 섹션
+		order   []string
+		byName  = map[string]*Profile{}
+		sess    = map[string]Session{}
 	)
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
@@ -76,7 +100,7 @@ func parseProfiles(r io.Reader) ([]Profile, []string, error) {
 			continue
 		}
 		if line[0] == '[' {
-			cur = nil
+			cur, curSess = nil, nil
 			end := strings.IndexByte(line, ']')
 			if end < 0 {
 				continue
@@ -88,8 +112,17 @@ func parseProfiles(r io.Reader) ([]Profile, []string, error) {
 				name = "default"
 			case strings.HasPrefix(sec, "profile "):
 				name = strings.TrimSpace(strings.TrimPrefix(sec, "profile "))
+			case strings.HasPrefix(sec, "sso-session "):
+				n := strings.TrimSpace(strings.TrimPrefix(sec, "sso-session "))
+				if n == "" {
+					continue
+				}
+				s := sess[n]
+				s.Name = n
+				curSess = &s
+				continue
 			default:
-				continue // sso-session, services 등은 프로필이 아니다
+				continue // services 등은 프로필이 아니다
 			}
 			if name == "" {
 				continue
@@ -104,39 +137,46 @@ func parseProfiles(r io.Reader) ([]Profile, []string, error) {
 			}
 			continue
 		}
-		if cur == nil {
-			continue
-		}
 		key, val, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
 		}
 		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
-		switch key {
-		case "sso_session":
-			cur.Session = val
-		case "sso_account_id":
-			cur.Account = val
-		case "sso_role_name":
-			cur.Role = val
+		switch {
+		case curSess != nil:
+			if key == "sso_region" {
+				curSess.Region = val
+			}
+			sess[curSess.Name] = *curSess
+		case cur != nil:
+			switch key {
+			case "sso_session":
+				cur.Session = val
+			case "sso_account_id":
+				cur.Account = val
+			case "sso_role_name":
+				cur.Role = val
+			case "region":
+				cur.Region = val
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	var skipped []string
+	cfg := &Config{Sessions: sess}
 	for _, name := range order {
 		p := byName[name]
 		if p.Session == "" {
 			continue
 		}
 		if !validName(p.Name) || !validName(p.Session) {
-			skipped = append(skipped, p.Name)
+			cfg.Skipped = append(cfg.Skipped, p.Name)
 			continue
 		}
-		profiles = append(profiles, *p)
+		cfg.Profiles = append(cfg.Profiles, *p)
 	}
-	return profiles, skipped, nil
+	return cfg, nil
 }
 
 // sessionsOf 는 프로필들이 참조하는 sso_session 이름을 중복 없이 처음 등장한 순서로 돌려준다.
@@ -150,10 +190,16 @@ func sessionsOf(profiles []Profile) []string {
 	return out
 }
 
-// runner 는 aws CLI 호출을 추상화한다. 테스트에서는 가짜 구현으로 바꾼다.
+// runner 는 AWS 호출을 추상화한다. 테스트에서는 가짜 구현으로 바꾼다.
 type runner interface {
-	// Check 는 프로필의 세션이 유효하면 nil, 아니면 사용자에게 보여줄 에러를 돌려준다.
-	Check(ctx context.Context, profile string) error
+	// CheckSession 은 sso-session 의 로그인 세션이 살아 있는지 검사한다. 캐시된 액세스
+	// 토큰이 만료됐으면 리프레시 토큰으로 갱신을 시도하고, 거절되면 에러를 돌려준다.
+	// 같은 세션을 동시에 갱신하면 리프레시 토큰이 교체되어 뒤의 요청이 거절되므로
+	// 호출자는 세션마다 한 번씩 순차로 불러야 한다.
+	CheckSession(ctx context.Context, s Session) error
+	// Check 는 프로필로 실제 API 를 호출해 역할 자격증명을 받을 수 있는지 검사한다.
+	// 유효하면 nil, 아니면 사용자에게 보여줄 에러를 돌려준다.
+	Check(ctx context.Context, p Profile) error
 	// Login 은 sso-session 단위로 로그인한다. aws CLI 가 직접 브라우저를 열고,
 	// 그 과정에서 출력하는 인증 URL 과 코드를 progress 로 전달한다.
 	Login(ctx context.Context, session string, progress func(LoginProgress)) error
@@ -191,16 +237,21 @@ const (
 	loginTimeout = 5 * time.Minute
 )
 
-// awsRunner 는 실제 aws CLI 를 실행한다.
+// awsRunner 는 검사는 AWS SDK 로, 로그인은 aws CLI 로 수행한다.
+//
+// 검사에 CLI 를 쓰지 않는 이유: CLI 는 역할 자격증명을 ~/.aws/cli/cache 에 디스크 캐시로
+// 두기 때문에, SSO 로그인 세션이 이미 끝났어도 캐시가 남아 있는 동안은 성공한다.
+// SDK 는 매번 ~/.aws/sso/cache 의 토큰 경로를 타므로 다른 SDK 기반 도구와 같은 판정을 낸다.
 type awsRunner struct {
-	bin string
+	bin        string // aws CLI 경로 (로그인용)
+	configPath string
 }
 
 // newAWSRunner 는 aws 실행 파일을 찾는다. GUI 앱으로 실행되면 PATH 가 최소한으로 잡혀
 // 있어서 Homebrew 경로 등을 직접 찾아본다.
-func newAWSRunner() (*awsRunner, error) {
+func newAWSRunner(configPath string) (*awsRunner, error) {
 	if p, err := exec.LookPath("aws"); err == nil {
-		return &awsRunner{bin: p}, nil
+		return &awsRunner{bin: p, configPath: configPath}, nil
 	}
 	for _, p := range []string{
 		"/opt/homebrew/bin/aws",
@@ -208,7 +259,7 @@ func newAWSRunner() (*awsRunner, error) {
 		"/usr/bin/aws",
 	} {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return &awsRunner{bin: p}, nil
+			return &awsRunner{bin: p, configPath: configPath}, nil
 		}
 	}
 	return nil, errors.New("aws CLI 를 찾을 수 없습니다. PATH 또는 /opt/homebrew/bin 을 확인하세요")
@@ -230,18 +281,70 @@ func (r *awsRunner) env() []string {
 	return append(env, "PATH="+strings.TrimPrefix(path, ":"), "PYTHONUNBUFFERED=1")
 }
 
-func (r *awsRunner) Check(ctx context.Context, profile string) error {
+func (r *awsRunner) CheckSession(ctx context.Context, s Session) error {
+	if s.Region == "" {
+		return fmt.Errorf("config 에 [sso-session %s] 섹션 또는 sso_region 이 없습니다", s.Name)
+	}
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, r.bin, "sts", "get-caller-identity", "--profile", profile, "--output", "json")
-	cmd.Env = r.env()
-	var stderr bytes.Buffer
-	cmd.Stdout = io.Discard
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return cliError(ctx, err, stderr.String())
+	// aws CLI 와 같은 위치(~/.aws/sso/cache/<sha1(세션 이름)>.json)를 쓴다.
+	path, err := ssocreds.StandardCachedTokenFilepath(s.Name)
+	if err != nil {
+		return sdkError(ctx, err)
 	}
-	return nil
+	client := ssooidc.New(ssooidc.Options{Region: s.Region})
+	// 토큰 값은 쓰지 않고 버린다. 만료됐으면 SDK 가 리프레시 토큰으로 갱신해 같은 파일에
+	// 같은 권한으로 다시 쓴다. 갱신이 거절되면 로그인 세션이 끝난 것이다.
+	_, err = ssocreds.NewSSOTokenProvider(client, path).RetrieveBearerToken(ctx)
+	return sdkError(ctx, err)
+}
+
+func (r *awsRunner) Check(ctx context.Context, p Profile) error {
+	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
+	opts := []func(*config.LoadOptions) error{
+		config.WithSharedConfigProfile(p.Name),
+		config.WithSharedConfigFiles([]string{r.configPath}),
+		config.WithSharedCredentialsFiles([]string{}), // ~/.aws/credentials 는 읽지 않는다
+		config.WithEC2IMDSClientEnableState(imds.ClientDisabled),
+	}
+	if p.Region != "" {
+		opts = append(opts, config.WithDefaultRegion(p.Region))
+	}
+	cfg, err := config.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return sdkError(ctx, err)
+	}
+	// 역할 자격증명은 프로세스 메모리에만 머물고 디스크에 캐시하지 않는다.
+	_, err = sts.NewFromConfig(cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	return sdkError(ctx, err)
+}
+
+// sdkError 는 SDK 에러를 사용자에게 보여줄 한 줄로 바꾼다. 토큰이나 요청 본문은 담지 않는다.
+func sdkError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return errors.New("시간 초과")
+	}
+	var grant *ssooidctypes.InvalidGrantException
+	var token *ssocreds.InvalidTokenError
+	switch {
+	case errors.As(err, &grant):
+		// 리프레시 토큰이 거절됨: 포털에서 로그아웃했거나 관리자가 세션을 끊었다
+		return errors.New("SSO 로그인 세션이 끝났습니다. 다시 로그인하세요")
+	case errors.As(err, &token), strings.Contains(err.Error(), "cannot be refreshed"):
+		// 액세스 토큰이 만료됐는데 리프레시 토큰이 없다 (sso_registration_scopes 미설정 등)
+		return errors.New("SSO 토큰이 만료되었습니다. 다시 로그인하세요")
+	case errors.Is(err, fs.ErrNotExist):
+		return errors.New("SSO 로그인 기록이 없습니다. 로그인하세요")
+	}
+	var api smithy.APIError
+	if errors.As(err, &api) {
+		return errors.New(shorten(api.ErrorCode() + ": " + api.ErrorMessage()))
+	}
+	return errors.New(shorten(err.Error()))
 }
 
 func (r *awsRunner) Login(ctx context.Context, session string, progress func(LoginProgress)) error {
@@ -285,10 +388,15 @@ func cliError(ctx context.Context, err error, stderr string) error {
 		}
 		line = strings.TrimPrefix(line, "aws: [ERROR]: ")
 		line = strings.TrimPrefix(line, "Error when retrieving token from sso: ")
-		if r := []rune(line); len(r) > 160 {
-			line = string(r[:160]) + "…"
-		}
-		return errors.New(line)
+		return errors.New(shorten(line))
 	}
 	return fmt.Errorf("aws 실행 실패: %v", err)
+}
+
+// shorten 은 화면에 보여줄 한 줄을 160자로 자른다.
+func shorten(s string) string {
+	if r := []rune(s); len(r) > 160 {
+		return string(r[:160]) + "…"
+	}
+	return s
 }

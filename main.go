@@ -32,6 +32,7 @@ type profileState struct {
 type app struct {
 	configPath string
 	profiles   []profileState
+	sessions   map[string]Session // sso-session 이름 → 설정
 	loadErr    string
 
 	busy      bool          // 검사 또는 로그인 진행 중
@@ -64,21 +65,23 @@ func (a *app) load() {
 	a.loggingIn = ""
 	a.loginProg = LoginProgress{}
 	a.profiles = nil
+	a.sessions = nil
 	a.loadErr = ""
 	a.message = ""
-	profiles, skipped, err := loadProfiles(a.configPath)
+	cfg, err := loadConfig(a.configPath)
 	if err != nil {
 		a.loadErr = fmt.Sprintf("설정을 읽을 수 없습니다: %v", err)
 		return
 	}
-	if len(skipped) > 0 {
-		a.message = fmt.Sprintf("건너뜀 (이름에 허용되지 않는 문자): %s", strings.Join(skipped, ", "))
+	if len(cfg.Skipped) > 0 {
+		a.message = fmt.Sprintf("건너뜀 (이름에 허용되지 않는 문자): %s", strings.Join(cfg.Skipped, ", "))
 	}
-	if len(profiles) == 0 {
+	if len(cfg.Profiles) == 0 {
 		a.loadErr = "sso_session 이 설정된 프로필이 없습니다: " + a.configPath
 		return
 	}
-	for _, p := range profiles {
+	a.sessions = cfg.Sessions
+	for _, p := range cfg.Profiles {
 		a.profiles = append(a.profiles, profileState{Profile: p})
 	}
 }
@@ -94,7 +97,8 @@ func (a *app) invalid() []Profile {
 	return out
 }
 
-// checkAll 은 모든 프로필을 병렬로 검사한다. 결과는 publish 로 메인 스레드에 반영한다.
+// checkAll 은 sso-session 마다 로그인 세션을 순차로 검사하고, 살아 있는 세션의 프로필은
+// 병렬로 검사한다. 결과는 publish 로 메인 스레드에 반영한다.
 func (a *app) checkAll() {
 	if a.busy || len(a.profiles) == 0 {
 		return
@@ -104,31 +108,86 @@ func (a *app) checkAll() {
 	a.message = "세션을 확인하는 중…"
 	gen := a.gen
 	remaining := len(a.profiles)
+	// done 은 publish 콜백(메인 스레드)에서만 부른다.
+	done := func() {
+		remaining--
+		if remaining == 0 {
+			a.busy = false
+			a.message = a.summary()
+		}
+	}
+
+	// 세션별 묶음. 백그라운드는 이 스냅샷만 읽고 앱 상태는 건드리지 않는다.
+	type group struct {
+		sess     Session
+		profiles []Profile
+		idx      []int // a.profiles 의 인덱스
+	}
+	var groups []group
+	byName := map[string]int{}
 	for i := range a.profiles {
 		a.profiles[i].status = statusChecking
 		a.profiles[i].err = ""
-		i := i
-		name := a.profiles[i].Name
-		a.spawn(func() {
-			err := a.run.Check(context.Background(), name)
-			a.publish(func() {
-				if gen != a.gen {
-					return // 그 사이 다시 확인이 시작됐다
-				}
-				if err == nil {
-					a.profiles[i].status = statusValid
-				} else {
-					a.profiles[i].status = statusInvalid
-					a.profiles[i].err = err.Error()
-				}
-				remaining--
-				if remaining == 0 {
-					a.busy = false
-					a.message = a.summary()
-				}
-			})
-		})
+		p := a.profiles[i].Profile
+		g, ok := byName[p.Session]
+		if !ok {
+			// config 에 [sso-session] 섹션이 없으면 Region 이 빈 채로 넘어가고 runner 가 알린다
+			sess := a.sessions[p.Session]
+			sess.Name = p.Session
+			g = len(groups)
+			byName[p.Session] = g
+			groups = append(groups, group{sess: sess})
+		}
+		if p.Region == "" {
+			p.Region = groups[g].sess.Region
+		}
+		groups[g].profiles = append(groups[g].profiles, p)
+		groups[g].idx = append(groups[g].idx, i)
 	}
+
+	a.spawn(func() {
+		// 세션 검사는 순차로 한다. 토큰 갱신이 동시에 일어나면 리프레시 토큰이 교체되어
+		// 뒤의 요청이 거절될 수 있다.
+		for _, g := range groups {
+			g := g
+			err := a.run.CheckSession(context.Background(), g.sess)
+			if err != nil {
+				a.publish(func() {
+					if gen != a.gen {
+						return // 그 사이 다시 확인이 시작됐다
+					}
+					for _, i := range g.idx {
+						a.profiles[i].status = statusInvalid
+						a.profiles[i].err = err.Error()
+						done()
+					}
+				})
+				continue
+			}
+			for k, i := range g.idx {
+				a.checkProfile(gen, i, g.profiles[k], done)
+			}
+		}
+	})
+}
+
+// checkProfile 은 프로필 하나를 백그라운드에서 검사하고 결과를 메인 스레드에 반영한다.
+func (a *app) checkProfile(gen, i int, p Profile, done func()) {
+	a.spawn(func() {
+		err := a.run.Check(context.Background(), p)
+		a.publish(func() {
+			if gen != a.gen {
+				return
+			}
+			if err == nil {
+				a.profiles[i].status = statusValid
+			} else {
+				a.profiles[i].status = statusInvalid
+				a.profiles[i].err = err.Error()
+			}
+			done()
+		})
+	})
 }
 
 // summary 는 검사 완료 후 하단에 보여줄 한 줄이다.
@@ -309,11 +368,12 @@ func (a *app) statusBadge(c *ui.Context, p *profileState) {
 }
 
 func main() {
-	run, err := newAWSRunner()
+	configPath := defaultConfigPath()
+	run, err := newAWSRunner(configPath)
 	if err != nil {
 		log.Fatal(err)
 	}
-	a := newApp(defaultConfigPath(), run)
+	a := newApp(configPath, run)
 	mygo.App.WhenReady(func() {
 		win := mygo.NewWindow(mygo.WindowOptions{
 			Title:     "sso-glow",

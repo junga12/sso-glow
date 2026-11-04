@@ -10,16 +10,28 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// fakeRunner 는 aws CLI 대신 미리 정한 결과를 돌려준다.
+// fakeRunner 는 AWS 호출 대신 미리 정한 결과를 돌려준다.
 type fakeRunner struct {
-	invalid  map[string]string // 프로필 → 에러 메시지
+	expired  map[string]string // sso-session → 에러 메시지 (CheckSession 실패)
+	invalid  map[string]string // 프로필 → 에러 메시지 (Check 실패)
+	sessions []Session         // CheckSession 이 받은 세션 순서
+	checked  []Profile         // Check 가 받은 프로필
 	logins   []string          // Login 이 호출된 세션 순서
 	loginErr error
 	progress LoginProgress // Login 중 progress 로 알릴 값. URL 이 비면 알리지 않는다
 }
 
-func (f *fakeRunner) Check(_ context.Context, profile string) error {
-	if msg, ok := f.invalid[profile]; ok {
+func (f *fakeRunner) CheckSession(_ context.Context, s Session) error {
+	f.sessions = append(f.sessions, s)
+	if msg, ok := f.expired[s.Name]; ok {
+		return errors.New(msg)
+	}
+	return nil
+}
+
+func (f *fakeRunner) Check(_ context.Context, p Profile) error {
+	f.checked = append(f.checked, p)
+	if msg, ok := f.invalid[p.Name]; ok {
 		return errors.New(msg)
 	}
 	return nil
@@ -33,7 +45,8 @@ func (f *fakeRunner) Login(_ context.Context, session string, progress func(Logi
 	if f.loginErr != nil {
 		return f.loginErr
 	}
-	// 로그인하면 모든 프로필이 유효해진다
+	// 로그인하면 모든 세션과 프로필이 유효해진다
+	f.expired = nil
 	f.invalid = nil
 	return nil
 }
@@ -95,6 +108,65 @@ func TestViewCheckAndLogin(t *testing.T) {
 	}
 	if !tt.HasText("SSO 로그인") {
 		t.Errorf("세션이 모두 유효하면 로그인 버튼은 남되 비활성이어야 한다: %q", tt.Texts())
+	}
+}
+
+func TestSessionExpiredMarksAllProfiles(t *testing.T) {
+	// 리프레시 토큰이 거절되면 그 세션을 쓰는 프로필은 개별 검사 없이 모두 만료다
+	run := &fakeRunner{expired: map[string]string{
+		"corp": "SSO 로그인 세션이 끝났습니다. 다시 로그인하세요",
+	}}
+	a := newTestApp(t, run)
+	tt := ui.NewTester(a.view, 560, 440)
+	if err := tt.Click("다시 확인"); err != nil {
+		t.Fatal(err)
+	}
+	if len(run.sessions) != 2 || run.sessions[0].Name != "corp" || run.sessions[1].Name != "partner" {
+		t.Errorf("세션마다 한 번씩 순서대로 검사해야 한다: %+v", run.sessions)
+	}
+	if run.sessions[0].Region != "ap-northeast-1" || run.sessions[1].Region != "" {
+		t.Errorf("sso_region 은 config 에서, 정의가 없으면 빈 값: %+v", run.sessions)
+	}
+	// corp 를 쓰는 dev·default 는 Check 없이 만료, partner 의 other-sso 만 Check 한다
+	if len(run.checked) != 1 || run.checked[0].Name != "other-sso" {
+		t.Errorf("세션이 끝난 프로필은 개별 검사하지 않는다: %+v", run.checked)
+	}
+	if !tt.HasText("3개 프로필 중 2개의 세션이 유효하지 않습니다.") {
+		t.Errorf("요약 줄: %q", tt.Texts())
+	}
+	if !tt.HasText("SSO 로그인 세션이 끝났습니다. 다시 로그인하세요") {
+		t.Errorf("세션 에러가 프로필 줄에 보여야 한다: %q", tt.Texts())
+	}
+	if !tt.HasText("SSO 로그인") || tt.HasText("SSO 로그인 (2개 세션)") {
+		t.Errorf("corp 하나만 로그인 대상이어야 한다: %q", tt.Texts())
+	}
+	if err := tt.Click("SSO 로그인"); err != nil {
+		t.Fatal(err)
+	}
+	if len(run.logins) != 1 || run.logins[0] != "corp" {
+		t.Errorf("logins=%v", run.logins)
+	}
+	if !tt.HasText("모든 AWS SSO 세션이 유효합니다. (3개 프로필)") {
+		t.Errorf("로그인 후 재검사: %q", tt.Texts())
+	}
+}
+
+func TestProfileRegionFallsBackToSession(t *testing.T) {
+	run := &fakeRunner{}
+	a := newTestApp(t, run)
+	a.checkAll()
+	byName := map[string]Profile{}
+	for _, p := range run.checked {
+		byName[p.Name] = p
+	}
+	if byName["dev"].Region != "ap-northeast-1" {
+		t.Errorf("프로필의 region 유지: %+v", byName["dev"])
+	}
+	if byName["default"].Region != "ap-northeast-1" {
+		t.Errorf("region 이 없으면 sso_region 으로 대체: %+v", byName["default"])
+	}
+	if byName["other-sso"].Region != "" {
+		t.Errorf("세션 정의도 없으면 빈 값: %+v", byName["other-sso"])
 	}
 }
 
